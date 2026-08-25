@@ -199,6 +199,10 @@ def main():
     p.add_argument("--upcoming", action="store_true", help="drop started/past sessions")
     p.add_argument("--sort", choices=("empty", "soonest", "movie"), default="empty")
     p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    p.add_argument("--cinemas", action="store_true",
+                   help="list every cinema code + name, then exit")
+    p.add_argument("--movies", action="store_true",
+                   help="list every movie id + title (incl. version variants), then exit")
     args = p.parse_args()
 
     async def run():
@@ -212,6 +216,20 @@ def main():
         ss = await discover_all(lang=args.lang, only_movie=args.movie,
                                 limit_movies=args.limit_movies,
                                 concurrency=args.concurrency, progress=progress)
+
+        if args.cinemas or args.movies:
+            if args.cinemas:
+                cs = sorted({(s.ci, s.cinema) for s in ss})
+                print(f"{len(cs)} cinemas")
+                for ci, cn in cs:
+                    print(f"{ci}\t{cn}")
+            if args.movies:
+                mv = sorted({(s.movie_id, s.movie) for s in ss})
+                print(f"{len(mv)} movies")
+                for mid, mn in mv:
+                    print(f"{mid}\t{mn}")
+            return
+
         dropped = 0
         if args.upcoming:
             before = len(ss)

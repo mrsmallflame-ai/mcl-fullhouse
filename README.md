@@ -65,6 +65,22 @@ python3 fill_all.py
 python3 fill_all.py --live --houses 4 --workers 12
 ```
 
+### One venue, one movie
+
+See **[CINEMAS.md](CINEMAS.md)** for all 14 venue codes and the exact-matching
+rules (including the version-variants gotcha). Quick forms:
+
+```bash
+python3 discover.py --cinemas                        # venue codes + names
+python3 discover.py --movies                         # movie ids + titles
+python3 fill_all.py --live --cinema 014 --movie "kung fu soccer" --poll 20
+```
+
+`--cinema` / `--movie` each accept a case-insensitive name substring or an
+exact code/id. `--poll SECONDS` switches to watchdog mode: re-scan the target's
+seat maps every N seconds and instantly re-claim seats freed by expired claims.
+Add `--drain` to exit automatically once nothing is left.
+
 ### CLI
 
 | flag | default | meaning |
@@ -77,6 +93,10 @@ python3 fill_all.py --live --houses 4 --workers 12
 | `--order empty\|soonest` | empty | most-free-seats first, or chronological |
 | `--lang 1\|2` | 2 | 中文 / English movie titles |
 | `--limit-movies N` | – | cap scan size (testing) |
+| `--movie X` | – | one movie: title substring or MovieSetId |
+| `--cinema X` | – | one venue: name substring or cinema code |
+| `--poll SEC` | – | watchdog mode: re-scan + re-claim every SEC seconds |
+| `--drain` | off | exit when no upcoming sessions match the filters |
 
 `blaze2` environment variables carry over: `BLAZE_SEATS` (seats per worker,
 default 6), `BLAZE_WORKERS`, `BLAZE_IDLE_POLL`.
@@ -85,8 +105,10 @@ default 6), `BLAZE_WORKERS`, `BLAZE_IDLE_POLL`.
 
 | file | role |
 |---|---|
-| `fill_all.py` | orchestrator: discover → queue → concurrent house-fillers → rediscover |
-| `discover.py` | full-programme enumeration via MCLWebAPI2 (read-only) |
+| `fill_all.py` | orchestrator: discover → queue → concurrent house-fillers → rediscover (or `--poll` watchdog) |
+| `discover.py` | full-programme enumeration via MCLWebAPI2 (read-only); `--cinemas` / `--movies` rosters |
+| `CINEMAS.md` | all venue codes + one-place-one-movie matching guide |
+| `launch_shards.ps1` | spawn N shard terminals or a watchdog window (Windows) |
 | `blaze2.py` | the proven pure-HTTP booking engine (unchanged from mcl-filler) |
 | `mcl_filler.py`, `find_sessions.py`, … | original single-session tooling, kept for reference |
 
