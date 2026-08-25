@@ -18,8 +18,18 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML,
 BASE = "https://www4.mclcinema.com"
 SEATS_PER = int(os.environ.get("BLAZE_SEATS", "6"))
 
+# Bookable seat statuses. Wheelchair spaces are deliberately EXCLUDED —
+# they are reserved for wheelchair users. Sofa/couple seats need the
+# separate twoSeatCount flow and are not handled yet.
+BOOKABLE_STATUSES = ("normal", "vibrate")
+
+
 def parse_seats(html):
-    """Extract Normal seats (name,row,col) from seat-plan HTML (any attr case)."""
+    """Extract bookable seats (Normal + Vibrate) with their real area codes.
+
+    Returns dicts: {sn, row, col, status, areacode, area}. Legend/decoration
+    <img> tags (no seatnum/row/column) are skipped by the regex requirements.
+    """
     seats, seen = [], set()
     for m in re.finditer(r'<img[^>]*seatnum="([A-Z]+\d+)"[^>]*>', html, re.I):
         tag = m.group(0)
@@ -27,13 +37,22 @@ def parse_seats(html):
         if sn in seen:
             continue
         st = re.search(r'status="([^"]*)"', tag, re.I)
-        if not st or st.group(1).lower() != "normal":
+        if not st or st.group(1).lower() not in BOOKABLE_STATUSES:
             continue
         row = re.search(r'\srow="(\d+)"', tag, re.I)
         col = re.search(r'\scolumn="(\d+)"', tag, re.I)
         if row and col:
             seen.add(sn)
-            seats.append((sn, row.group(1), col.group(1)))
+            ac = re.search(r'areacode="([^"]*)"', tag, re.I)
+            ar = re.search(r'\sarea="([^"]*)"', tag, re.I)
+            seats.append({
+                "sn": sn,
+                "row": row.group(1),
+                "col": col.group(1),
+                "status": st.group(1).lower(),
+                "areacode": ac.group(1) if ac else "0000000001",
+                "area": ar.group(1) if ar else "1",
+            })
     return seats
 
 async def fetch_seat_plan(c, ci, si):
@@ -117,12 +136,12 @@ async def book_chunk(ci, si, wid, seats, sem, results):
                 pickseats_html = r.text
 
                 data = {}
-                for i, (sn, row, col) in enumerate(seats):
-                    data[f"selectedSeats[{i}][AreaCode]"] = "0000000001"
-                    data[f"selectedSeats[{i}][AreaNumber]"] = "1"
-                    data[f"selectedSeats[{i}][RowIndex]"] = str(row)
-                    data[f"selectedSeats[{i}][ColumnIndex]"] = str(col)
-                    data[f"selectedSeats[{i}][SeatName]"] = sn
+                for i, seat in enumerate(seats):
+                    data[f"selectedSeats[{i}][AreaCode]"] = seat["areacode"]
+                    data[f"selectedSeats[{i}][AreaNumber]"] = str(seat["area"])
+                    data[f"selectedSeats[{i}][RowIndex]"] = str(seat["row"])
+                    data[f"selectedSeats[{i}][ColumnIndex]"] = str(seat["col"])
+                    data[f"selectedSeats[{i}][SeatName]"] = seat["sn"]
                 data["languageCulture"] = "en-US"
                 data["platform"] = "DesktopWeb"
                 r = await c.post(f"{BASE}/MCL.Front.Ticketing/PickSeats/SubmitSelectedSeat",
@@ -152,7 +171,7 @@ async def book_chunk(ci, si, wid, seats, sem, results):
                 r = await c.post(BASE + H.unescape(target), data=f3)
                 ok = "Payment" in str(r.url) or "payment" in r.text[:4000].lower()
                 dt = time.time() - t0
-                seats_str = ",".join(s[0] for s in seats)
+                seats_str = ",".join(s["sn"] for s in seats)
                 if ok:
                     results[wid] = f"W{wid}: ✅ [{seats_str}] BOOKED {dt:.1f}s"
                     return n
