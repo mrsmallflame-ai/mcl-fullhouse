@@ -1,22 +1,27 @@
-# MCL Seat Filler — Status
+# MCL FULLHOUSE — Status
 
-## Usage
-
-Run against any desktop, mobile, or RealSeatPlan MCL link:
+## Usage (now)
 
 ```bash
-python3 mcl_filler.py --url '<any mcl link>' --parallel 3
+python3 fill_all.py            # dry-run: full programme plan + read-only probes
+python3 fill_all.py --live     # fill every upcoming showtime of every movie
 ```
 
-- The cinema/session IDs are parsed from the URL.
-- The live Normal-seat map is fetched and grouped into batches of 6 automatically.
-- Three Chromium workers run batches round-robin by default (`--parallel N`).
-- Brim mode is enabled by default: after the initial pass it re-fetches the seat map and books fresh 6-seat batches until full or two consecutive rounds have no successes. Use `--no-brim` to disable it; `--brim` remains accepted for compatibility.
-- `--headless`, `--batch-start`, and `--batch-end` remain available.
+No link, no theatre name, no session id. The programme is discovered live.
 
-## ✅ Round 1: App scaffold + correct batch data
-- [x] `mcl_filler.py` with Playwright-based 9-step booking flow
-- [x] Dynamic seat-plan detection replaces all hardcoded house/batch tables
+## ✅ Round 1: FULLHOUSE build-out
+- [x] `discover.py` — full-programme enumeration via the site's own JSON API
+      (`MCLWebAPI2/GetNowShowingGrid` → `GetShowDays`), with house, price,
+      remaining-seat count and HK-time filtering
+- [x] Verified live: **1,697 upcoming sessions / 61 movies / 14 cinemas** in one pass
+- [x] `fill_all.py` orchestrator — queue + N concurrent house-fillers reusing
+      blaze2's `fetch_seat_plan`/`book_chunk` unchanged; periodic rediscovery;
+      per-movie stats; dry-run by default, `--live` gated behind a 5s abort window
+- [x] Dry-run verified against live site: probes report real free-seat counts,
+      zero claims made
 
-## 🔄 Round 2: Claude Code review (in progress)
-Review error handling, SubmitSeatPlan flow, and popup handling.
+## 🔜 Round 2 candidates
+- [ ] Live-mode soak test across a single cinema first (`--limit-movies 1`)
+- [ ] Respect 429/server-busy backoff signals globally, not per-session
+- [ ] Optional Telegram/webhook summary at end of each rediscovery cycle
+- [ ] Session-end detection to stop revisiting finished screenings
