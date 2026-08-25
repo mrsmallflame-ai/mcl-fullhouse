@@ -129,9 +129,110 @@ async def fill_one(sc: httpx.AsyncClient, s: Session, stats: Stats,
     return "stalled" if total == 0 else "partial", total
 
 
+async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
+    """Watchdog mode (--poll N): rescan the target's seat maps every N seconds;
+    whenever freed seats appear (expired claims), claim them again."""
+    targets = await harvest_sessions(args)
+    movies = {s.movie for s in targets}
+    cinemas = {s.cinema for s in targets}
+    label_bits = []
+    if args.cinema:
+        label_bits.append(f"cinema~{args.cinema}")
+    if args.movie:
+        label_bits.append(f"movie~{args.movie}")
+    print(f"🎬 watching {len(targets)} sessions ({len(movies)} movies | "
+          f"{len(cinemas)} cinemas){' | ' + ', '.join(label_bits) if label_bits else ''}")
+    if not targets:
+        if args.drain:
+            print("🏁 nothing matches these filters right now — done.")
+            return
+        print("(nothing yet — will keep re-checking)")
+
+    if not args.live:
+        await dry_run(sc, targets, min(args.probe, len(targets)))
+        return
+
+    print(f"\n⚠️  LIVE WATCH in 5s — every {args.poll:.0f}s the seat maps are re-scanned; "
+          f"\n    freed seats are re-claimed. Ctrl+C to abort.\n")
+    await asyncio.sleep(5)
+
+    last_harvest = time.time()
+    while True:
+        t_pass = time.time()
+        alive = []
+        for s in targets:
+            dt = s.start_dt()
+            if dt is not None and datetime(dt.year, dt.month, dt.day, dt.hour,
+                                           dt.minute, tzinfo=HK_TZ) < datetime.now(HK_TZ):
+                continue  # screening already started -> drop quietly
+            alive.append(s)
+            try:
+                seats = await fetch_seat_plan(sc, s.ci, str(s.si))
+            except Exception:
+                seats = None
+            if seats:                       # freed / unsold seats exist -> grab them
+                status, total = await fill_one(sc, s, stats, args.workers, args.max_rounds)
+                if total:
+                    print(f"  👀 si={s.si} {status} (+{total}) | {stats.line()}")
+        targets = alive
+
+        if time.time() - last_harvest >= args.refresh * 60:
+            try:
+                fresh = await harvest_sessions(args)
+                known = {s.si for s in targets}
+                added = [s for s in fresh if s.si not in known]
+                if added:
+                    print(f"  ♻️  +{len(added)} new sessions now watched")
+                targets.extend(added)
+            except Exception as e:
+                print(f"  ⚠️ target refresh failed: {str(e)[:70]}")
+            last_harvest = time.time()
+            if args.drain and not targets:
+                print("🏁 drained: nothing left to watch — stopping.")
+                return
+
+        waited = time.time() - t_pass
+        await asyncio.sleep(max(0.5, args.poll - waited))
+
+
+async def harvest_sessions(args) -> list[Session]:
+    """Discover + filter (movie/cinema/shard/order/upcoming). Shared by all modes."""
+    def prog(m):
+        pass  # quiet during orchestration; discovery summary printed separately
+    ss = await discover_all(lang=args.lang,
+                            limit_movies=args.limit_movies,
+                            concurrency=8, progress=prog)
+    if args.movie:
+        needle = args.movie.lower()
+        ss = [s for s in ss
+              if needle in s.movie.lower() or s.movie_id == args.movie]
+        if not ss:
+            print(f"🤷 no sessions matching movie filter: {args.movie!r}")
+    if args.cinema:
+        cneed = args.cinema.lower()
+        ss = [s for s in ss
+              if cneed in s.cinema.lower() or s.ci == args.cinema]
+        if not ss:
+            print(f"🤷 no sessions matching cinema filter: {args.cinema!r}")
+    ss = filter_upcoming(ss)
+    key = {
+        "empty": lambda s: (-(s.remaining or 0), s.showdate),
+        "soonest": lambda s: (s.start_dt() or datetime.max.replace(tzinfo=HK_TZ),),
+    }[args.order]
+    ss.sort(key=key)
+    if getattr(args, "shard", None):
+        si_, sn_ = (int(x) for x in args.shard.split("/", 1))
+        ss = [s for k, s in enumerate(ss) if k % sn_ == si_ - 1]
+    return ss
+
+
 async def supervisor(args, stats: Stats) -> None:
     async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(12, connect=6)) as sc:
         sc.headers.update({"User-Agent": UA})
+
+        if getattr(args, "poll", None):
+            await watch_targets(sc, args, stats)
+            return
 
         # optional deterministic sharding: --shard I/N takes every Nth session
         shard = None
@@ -145,27 +246,7 @@ async def supervisor(args, stats: Stats) -> None:
             shard = (si_, sn_)
 
         async def harvest() -> list[Session]:
-            def prog(m):
-                pass  # quiet during orchestration; discovery summary printed separately
-            ss = await discover_all(lang=args.lang,
-                                    limit_movies=args.limit_movies,
-                                    concurrency=8, progress=prog)
-            if args.movie:
-                needle = args.movie.lower()
-                ss = [s for s in ss
-                      if needle in s.movie.lower() or s.movie_id == args.movie]
-                if not ss:
-                    print(f"🤷 no sessions matching movie filter: {args.movie!r}")
-            ss = filter_upcoming(ss)
-            key = {
-                "empty": lambda s: (-(s.remaining or 0), s.showdate),
-                "soonest": lambda s: (s.start_dt() or datetime.max.replace(tzinfo=HK_TZ),),
-            }[args.order]
-            ss.sort(key=key)
-            if shard:
-                i_, n_ = shard
-                ss = [s for k, s in enumerate(ss) if k % n_ == i_ - 1]
-            return ss
+            return await harvest_sessions(args)
 
         print("🔎 discovering the full programme ...")
         sessions = await harvest()
@@ -222,6 +303,9 @@ async def supervisor(args, stats: Stats) -> None:
                     fresh = [s for s in await harvest()]
                     added = enqueue(fresh)
                     print(f"  ♻️  rediscovered programme: +{added} new/reopened sessions queued")
+                    if args.drain and not fresh and queue.empty():
+                        print("  🏁 drained: no upcoming sessions left for these filters — stopping.")
+                        stop.set()
                 except Exception as e:
                     print(f"  ⚠️ refresh failed: {str(e)[:70]}")
 
@@ -247,6 +331,13 @@ def main():
                    help="empty = most free seats first (default); soonest = chronological")
     p.add_argument("--limit-movies", type=int, help="cap movies scanned (testing)")
     p.add_argument("--movie", help="only this movie: case-insensitive name substring or MovieSetId")
+    p.add_argument("--cinema", help="only this location: case-insensitive cinema name substring or cinema code")
+    p.add_argument("--poll", type=float, metavar="SECONDS",
+                   help="watchdog mode: re-scan the target's seat maps every N seconds "
+                        "(e.g. --poll 20) and instantly re-claim freed seats; "
+                        "overrides queue/rotate mode")
+    p.add_argument("--drain", action="store_true",
+                   help="exit once no upcoming sessions match the filters instead of running forever")
     p.add_argument("--shard", metavar="I/N",
                    help="run slice I of N (e.g. 1/3) — split the queue across terminals; "
                         "each terminal must use a different I")
