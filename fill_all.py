@@ -133,6 +133,17 @@ async def supervisor(args, stats: Stats) -> None:
     async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(12, connect=6)) as sc:
         sc.headers.update({"User-Agent": UA})
 
+        # optional deterministic sharding: --shard I/N takes every Nth session
+        shard = None
+        if args.shard:
+            try:
+                si_, sn_ = (int(x) for x in args.shard.split("/", 1))
+                if not (1 <= si_ <= sn_ and sn_ > 1):
+                    raise ValueError
+            except Exception:
+                raise SystemExit(f"--shard must look like '1/3', got {args.shard!r}")
+            shard = (si_, sn_)
+
         async def harvest() -> list[Session]:
             def prog(m):
                 pass  # quiet during orchestration; discovery summary printed separately
@@ -151,13 +162,18 @@ async def supervisor(args, stats: Stats) -> None:
                 "soonest": lambda s: (s.start_dt() or datetime.max.replace(tzinfo=HK_TZ),),
             }[args.order]
             ss.sort(key=key)
+            if shard:
+                i_, n_ = shard
+                ss = [s for k, s in enumerate(ss) if k % n_ == i_ - 1]
             return ss
 
         print("🔎 discovering the full programme ...")
         sessions = await harvest()
         movies = {s.movie for s in sessions}
         cinemas = {s.cinema for s in sessions}
-        print(f"🎬 {len(sessions)} upcoming sessions | {len(movies)} movies | {len(cinemas)} cinemas")
+        label = f" | shard {shard[0]}/{shard[1]}" if shard else ""
+        print(f"🎬 {len(sessions)} upcoming sessions | {len(movies)} movies | "
+              f"{len(cinemas)} cinemas{label}")
 
         if not args.live:
             await dry_run(sc, sessions, args.probe)
@@ -231,6 +247,9 @@ def main():
                    help="empty = most free seats first (default); soonest = chronological")
     p.add_argument("--limit-movies", type=int, help="cap movies scanned (testing)")
     p.add_argument("--movie", help="only this movie: case-insensitive name substring or MovieSetId")
+    p.add_argument("--shard", metavar="I/N",
+                   help="run slice I of N (e.g. 1/3) — split the queue across terminals; "
+                        "each terminal must use a different I")
     p.add_argument("--probe", type=int, default=25, help="sessions to live-probe in dry-run")
     args = p.parse_args()
 
