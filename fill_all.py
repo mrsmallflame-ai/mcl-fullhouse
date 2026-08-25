@@ -139,6 +139,12 @@ async def supervisor(args, stats: Stats) -> None:
             ss = await discover_all(lang=args.lang,
                                     limit_movies=args.limit_movies,
                                     concurrency=8, progress=prog)
+            if args.movie:
+                needle = args.movie.lower()
+                ss = [s for s in ss
+                      if needle in s.movie.lower() or s.movie_id == args.movie]
+                if not ss:
+                    print(f"🤷 no sessions matching movie filter: {args.movie!r}")
             ss = filter_upcoming(ss)
             key = {
                 "empty": lambda s: (-(s.remaining or 0), s.showdate),
@@ -224,6 +230,7 @@ def main():
     p.add_argument("--order", choices=("empty", "soonest"), default="empty",
                    help="empty = most free seats first (default); soonest = chronological")
     p.add_argument("--limit-movies", type=int, help="cap movies scanned (testing)")
+    p.add_argument("--movie", help="only this movie: case-insensitive name substring or MovieSetId")
     p.add_argument("--probe", type=int, default=25, help="sessions to live-probe in dry-run")
     args = p.parse_args()
 
