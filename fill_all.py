@@ -146,7 +146,7 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
         if args.drain:
             print("🏁 nothing matches these filters right now — done.")
             return
-        print("(nothing yet — will keep re-checking)")
+        print("(0 matches - auto-rechecking every ~60s)")
 
     if not args.live:
         await dry_run(sc, targets, min(args.probe, len(targets)))
@@ -176,7 +176,8 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
                     print(f"  👀 si={s.si} {status} (+{total}) | {stats.line()}")
         targets = alive
 
-        if time.time() - last_harvest >= args.refresh * 60:
+        recheck = args.refresh * 60 if targets else max(args.poll, 60.0)
+        if time.time() - last_harvest >= recheck:
             try:
                 fresh = await harvest_sessions(args)
                 known = {s.si for s in targets}
@@ -198,7 +199,8 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
 async def harvest_sessions(args) -> list[Session]:
     """Discover + filter (movie/cinema/shard/order/upcoming). Shared by all modes."""
     def prog(m):
-        pass  # quiet during orchestration; discovery summary printed separately
+        if m.startswith("!"):   # surface fetch failures even in quiet modes
+            print("  . " + m)
     ss = await discover_all(lang=args.lang,
                             limit_movies=args.limit_movies,
                             concurrency=8, progress=prog)

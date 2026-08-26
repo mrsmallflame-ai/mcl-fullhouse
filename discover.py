@@ -151,13 +151,15 @@ async def discover_all(lang: int = 2,
 
         sem = asyncio.Semaphore(max(1, concurrency))
         done = 0
+        failed = 0
 
         async def one(m):
-            nonlocal done
+            nonlocal done, failed
             async with sem:
                 try:
                     ss = await get_movie_sessions(c, m, lang)
                 except Exception as e:
+                    failed += 1
                     if progress:
                         progress(f"! {m['name'][:40]}: {str(e)[:60]}")
                     ss = []
@@ -167,6 +169,10 @@ async def discover_all(lang: int = 2,
                 return ss
 
         lists = await asyncio.gather(*(one(m) for m in movies))
+
+    if movies and failed == len(movies):
+        raise RuntimeError(
+            f"all {failed} movie session fetches failed - network or API problem, not an empty programme")
 
     seen, uniq = set(), []
     for lst in lists:
