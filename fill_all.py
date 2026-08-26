@@ -214,6 +214,11 @@ async def harvest_sessions(args) -> list[Session]:
               if cneed in s.cinema.lower() or s.ci == args.cinema]
         if not ss:
             print(f"🤷 no sessions matching cinema filter: {args.cinema!r}")
+    if getattr(args, "date", None):
+        want = args.date.strip()
+        ss = [s for s in ss if s.showdate == want]
+        if not ss:
+            print("[!] no sessions found on {want} for these filters")
     ss = filter_upcoming(ss)
     key = {
         "empty": lambda s: (-(s.remaining or 0), s.showdate),
@@ -332,6 +337,7 @@ def main():
     p.add_argument("--limit-movies", type=int, help="cap movies scanned (testing)")
     p.add_argument("--movie", help="only this movie: case-insensitive name substring or MovieSetId")
     p.add_argument("--cinema", help="only this location: case-insensitive cinema name substring or cinema code")
+    p.add_argument("--date", help="only showtimes on this date: YYYY-MM-DD")
     p.add_argument("--poll", type=float, metavar="SECONDS",
                    help="watchdog mode: re-scan the target's seat maps every N seconds "
                         "(e.g. --poll 20) and instantly re-claim freed seats; "

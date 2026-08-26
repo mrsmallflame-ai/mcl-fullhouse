@@ -12,6 +12,7 @@
 param(
     [string]$Movie = "",
     [string]$Cinema = "",
+    [string]$Date = "",
     [int]$Shards = 3,
     [ValidateRange(1, 24)]
     [int]$Houses = 3,
@@ -35,6 +36,7 @@ for ($i = 1; $i -le $Shards; $i++) {
     if ($Live)        { $inner += ' --live' }
     if ($Movie)       { $inner += " --movie '$Movie'" }
     if ($Cinema)      { $inner += " --cinema '$Cinema'" }
+    if ($Date)        { $inner += " --date '$Date'" }
     if ($Drain)       { $inner += ' --drain' }
     if ($Poll -gt 0)  { $inner += " --poll $Poll" }
     if ($Poll -le 0)  { $inner += " --shard $i/$Shards --houses $Houses" }

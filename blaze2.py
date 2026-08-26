@@ -16,7 +16,7 @@ import httpx
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 BASE = "https://www4.mclcinema.com"
-SEATS_PER = int(os.environ.get("BLAZE_SEATS", "6"))
+SEATS_PER = int(os.environ.get("BLAZE_SEATS", "10"))  # upper bound; real per-transaction cap is read live from MCL's dropdown
 
 # Bookable seat statuses. Wheelchair spaces are deliberately EXCLUDED —
 # they are reserved for wheelchair users. Sofa/couple seats need the
@@ -54,6 +54,33 @@ def parse_seats(html):
                 "area": ar.group(1) if ar else "1",
             })
     return seats
+
+
+def parse_ticket_options(sel_html):
+    """All quantity options from MCL's ticket-type <select>."""
+    opts = []
+    for om in re.finditer(r'<option[^>]*>', sel_html):
+        tag = om.group(0)
+        code = re.search(r'code="([0-9A-Za-z]+)"', tag)
+        val = re.search(r'value="(\d+)"', tag)
+        price = re.search(r'price="([\d.]+)"', tag)
+        name = re.search(r'ticketTypeName="([^"]*)"', tag)
+        if code and val:
+            opts.append({"code": code.group(1),
+                         "name": H.unescape(name.group(1)) if name else "",
+                         "price": int(float(price.group(1))) if price else 0,
+                         "qty": int(val.group(1))})
+    return opts
+
+
+def choose_quantity(opts, wanted):
+    """Largest per-transaction quantity MCL actually offers, <= wanted."""
+    ok = [o for o in opts if o["qty"] <= wanted]
+    return max(ok, key=lambda o: o["qty"]) if ok else None
+
+
+_CAP_SEEN = set()
+
 
 async def fetch_seat_plan(c, ci, si):
     r = await c.get("https://info.mclcinema.com/RealSeatPlan/SeatPlan",
@@ -100,20 +127,17 @@ async def book_chunk(ci, si, wid, seats, sem, results):
                 sel = re.search(r'<select[^>]*>(.*?)</select>', ttype_html, re.S)
                 if not m_stt or not sel:
                     results[wid] = f"W{wid}: no tickettype endpoint"; return 0
-                opt = None
-                for om in re.finditer(r'<option[^>]*>', sel.group(1)):
-                    tag = om.group(0)
-                    code = re.search(r'code="([0-9A-Za-z]+)"', tag)
-                    val = re.search(r'value="(\d+)"', tag)
-                    price = re.search(r'price="([\d.]+)"', tag)
-                    name = re.search(r'ticketTypeName="([^"]*)"', tag)
-                    if code and val and val.group(1) == str(n):
-                        opt = {"code": code.group(1),
-                               "name": H.unescape(name.group(1)) if name else "",
-                               "price": int(float(price.group(1))) if price else 0}
-                        break
+                opts = parse_ticket_options(sel.group(1))
+                opt = choose_quantity(opts, n)   # true MCL per-transaction cap, discovered live
                 if not opt:
-                    results[wid] = f"W{wid}: no qty-{n} option"; return 0
+                    results[wid] = f"W{wid}: no qty option"; return 0
+                q = opt["qty"]
+                _cap_key = (str(ci), str(si))
+                if _cap_key not in _CAP_SEEN:
+                    _CAP_SEEN.add(_cap_key)
+                    print(f"   [cap] {ci}/{si}: max {q} seats/transaction")
+                seats = seats[:q]
+                n = q
                 payload = {"selectedValues": json.dumps({
                     "Tickets": [{"TicketTypeCode": opt["code"], "TicketTypeName": opt["name"],
                                   "Quantity": n, "Price": opt["price"]}],
