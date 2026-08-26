@@ -157,6 +157,7 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
     await asyncio.sleep(5)
 
     last_harvest = time.time()
+    last_req = blaze2.REQ_COUNT
     pass_no = 0
     scan_sem = asyncio.Semaphore(max(1, getattr(args, "watch_concurrency", 6)))
 
@@ -202,9 +203,12 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
 
         waited = time.time() - t_pass
         pause = max(0.5, args.poll - waited)
+        req_delta = blaze2.REQ_COUNT - last_req
+        last_req = blaze2.REQ_COUNT
         if pass_no % 10 == 1:
+            rate = req_delta / max(waited + pause, 0.1) * 60
             print(f"  ⏱️  pass {pass_no}: {len(targets)} houses scanned in {scan_secs:.1f}s "
-                  f"| next scan in {pause:.0f}s")
+                  f"| ~{req_delta} req/pass (~{rate:.0f}/min) | next scan in {pause:.0f}s")
         await asyncio.sleep(pause)
 
 

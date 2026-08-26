@@ -18,6 +18,10 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML,
 BASE = "https://www4.mclcinema.com"
 SEATS_PER = int(os.environ.get("BLAZE_SEATS", "10"))  # upper bound; real per-transaction cap is read live from MCL's dropdown
 
+# Self-telemetry: total outbound HTTP requests this process has made.
+# Read it (or diff it) from the orchestrator to see your own footprint live.
+REQ_COUNT = 0
+
 # Bookable seat statuses. Wheelchair spaces are deliberately EXCLUDED —
 # they are reserved for wheelchair users. Sofa/couple seats need the
 # separate twoSeatCount flow and are not handled yet.
@@ -83,16 +87,20 @@ _CAP_SEEN = set()
 
 
 async def fetch_seat_plan(c, ci, si):
+    global REQ_COUNT
     r = await c.get("https://info.mclcinema.com/RealSeatPlan/SeatPlan",
                     params={"cinemaCode": ci, "filmSessionId": si, "language": "en-US",
                             "seatCount": SEATS_PER, "twoSeatCount": 0},
                     headers={"Referer": f"https://www.mclcinema.com/MCLSelectSeat.aspx?visLang=2&ci={ci}&si={si}"})
+    REQ_COUNT += 1
     if "server busy" in r.text.lower():
         return None
     return parse_seats(r.text)
 
 async def book_chunk(ci, si, wid, seats, sem, results):
     """One worker books its assigned chunk. Isolated cookie jar + connection."""
+    global REQ_COUNT
+    REQ_COUNT += 8   # one full claim chain ≈ 8 HTTP round-trips
     n = len(seats)
     async with sem:
         t0 = time.time()
