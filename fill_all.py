@@ -157,24 +157,32 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
     await asyncio.sleep(5)
 
     last_harvest = time.time()
-    while True:
-        t_pass = time.time()
-        alive = []
-        for s in targets:
-            dt = s.start_dt()
-            if dt is not None and datetime(dt.year, dt.month, dt.day, dt.hour,
-                                           dt.minute, tzinfo=HK_TZ) < datetime.now(HK_TZ):
-                continue  # screening already started -> drop quietly
-            alive.append(s)
+    pass_no = 0
+    scan_sem = asyncio.Semaphore(max(1, getattr(args, "watch_concurrency", 6)))
+
+    async def check_one(s: Session):
+        """Probe one house; if seats are visible, fill it. Returns liveness."""
+        dt = s.start_dt()
+        if dt is not None and datetime(dt.year, dt.month, dt.day, dt.hour,
+                                       dt.minute, tzinfo=HK_TZ) < datetime.now(HK_TZ):
+            return None  # screening already started -> drop
+        async with scan_sem:
             try:
                 seats = await fetch_seat_plan(sc, s.ci, str(s.si))
             except Exception:
-                seats = None
-            if seats:                       # freed / unsold seats exist -> grab them
-                status, total = await fill_one(sc, s, stats, args.workers, args.max_rounds)
-                if total:
-                    print(f"  👀 si={s.si} {status} (+{total}) | {stats.line()}")
-        targets = alive
+                return s
+        if seats:                       # freed / unsold seats exist -> grab them now
+            status, total = await fill_one(sc, s, stats, args.workers, args.max_rounds)
+            if total:
+                print(f"  👀 si={s.si} {status} (+{total}) | {stats.line()}")
+        return s
+
+    while True:
+        t_pass = time.time()
+        pass_no += 1
+        checked = await asyncio.gather(*(check_one(s) for s in targets))
+        targets = [s for s in checked if s is not None]
+        scan_secs = time.time() - t_pass
 
         recheck = args.refresh * 60 if targets else max(args.poll, 60.0)
         if time.time() - last_harvest >= recheck:
@@ -193,7 +201,11 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
                 return
 
         waited = time.time() - t_pass
-        await asyncio.sleep(max(0.5, args.poll - waited))
+        pause = max(0.5, args.poll - waited)
+        if pass_no % 10 == 1:
+            print(f"  ⏱️  pass {pass_no}: {len(targets)} houses scanned in {scan_secs:.1f}s "
+                  f"| next scan in {pause:.0f}s")
+        await asyncio.sleep(pause)
 
 
 async def harvest_sessions(args) -> list[Session]:
@@ -344,6 +356,8 @@ def main():
                    help="watchdog mode: re-scan the target's seat maps every N seconds "
                         "(e.g. --poll 20) and instantly re-claim freed seats; "
                         "overrides queue/rotate mode")
+    p.add_argument("--watch-concurrency", type=int, default=6, metavar="N",
+                   help="houses probed simultaneously per watchdog pass (default 6)")
     p.add_argument("--drain", action="store_true",
                    help="exit once no upcoming sessions match the filters instead of running forever")
     p.add_argument("--shard", metavar="I/N",
