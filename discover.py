@@ -26,6 +26,9 @@ from typing import Optional
 
 import httpx
 
+from mclhosts import hosts
+from governor import Signal, classify, retry_after_seconds, shared_governor
+
 if hasattr(sys.stdout, "reconfigure"):  # keep emoji/中文 intact on Windows consoles
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -34,8 +37,13 @@ if hasattr(sys.stdout, "reconfigure"):  # keep emoji/中文 intact on Windows co
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-API_BASE = "https://www.mclcinema.com/MCLWebAPI2/"
 HK_TZ = timezone(timedelta(hours=8))  # cinema local time
+
+
+def _api_base() -> str:
+    """MCLWebAPI2 root, resolved from env-overridable host (mclhosts)."""
+    return f"{hosts()[0]}/MCLWebAPI2/"
+
 
 # 'Thu, Aug 27, 10:00 AM, IMAX/House 12 $130'
 _TIME_RE = re.compile(r"(\d{1,2}:\d{2})\s*([AaPp][Mm])")
@@ -90,9 +98,17 @@ def _parse_sn(sn: str):
 
 async def get_movies(c: httpx.AsyncClient, lang: int = 2) -> list[dict]:
     """All now-showing movies: [{id, mn(name), t(type), ls}, ...]."""
-    r = await c.get(API_BASE + "GetNowShowingGrid.aspx", params={"l": lang})
-    r.raise_for_status()
-    data = r.json()
+    gov = shared_governor()
+    await gov.acquire("www")
+    try:
+        r = await c.get(_api_base() + "GetNowShowingGrid.aspx", params={"l": lang})
+        sig = classify(r.status_code, r.text[:200])
+        gov.report("www", sig, retry_after_seconds(r.headers))
+        if sig is not Signal.OK:
+            raise RuntimeError(f"GetNowShowingGrid pressure ({sig.name})")
+        data = r.json()
+    finally:
+        gov.release("www")
     return [
         {"id": str(m["id"]), "name": (m.get("mn") or "").strip(), "type": m.get("t", "S")}
         for m in data.get("movies", [])
@@ -103,10 +119,19 @@ async def get_movies(c: httpx.AsyncClient, lang: int = 2) -> list[dict]:
 async def get_movie_sessions(c: httpx.AsyncClient, movie: dict, lang: int = 2) -> list[Session]:
     """Flatten versions->days->cinemas->sessions for one movie."""
     out: list[Session] = []
-    r = await c.get(API_BASE + "GetShowDays.aspx",
-                    params={"l": lang, "t": "s", "id": movie["id"]})
-    r.raise_for_status()
-    for ver in r.json() or []:
+    gov = shared_governor()
+    await gov.acquire("www")
+    try:
+        r = await c.get(_api_base() + "GetShowDays.aspx",
+                        params={"l": lang, "t": "s", "id": movie["id"]})
+        sig = classify(r.status_code, r.text[:200])
+        gov.report("www", sig, retry_after_seconds(r.headers))
+        if sig is not Signal.OK:
+            raise RuntimeError(f"GetShowDays pressure ({sig.name})")
+        payload = r.json() or []
+    finally:
+        gov.release("www")
+    for ver in payload:
         vname = ver.get("vn") or ver.get("v") or ""
         for day in ver.get("sd") or []:
             showdate = day.get("ShowDate") or ""

