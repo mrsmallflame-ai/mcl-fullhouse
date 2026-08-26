@@ -47,6 +47,36 @@ first claim. Bookings stop at the payment page — no payment details are ever
 entered — exactly like the original engine. Be a decent creature: don't run
 this against a screening other humans actually want to attend.
 
+## Performance: the only limit is MCL
+
+Every self-imposed throttle is gone. One shared **AIMD governor** paces all
+traffic — discovery, seat-map scans, booking chains — ramping concurrency up
+until MCL itself pushes back (`Server busy`, 429/5xx, `Retry-After`), backing
+off with full jitter in milliseconds-scale cooldowns, and re-saturating within
+seconds of clean air. Fixed sleeps are gone; seat maps are scanned
+concurrently with priority for sessions that just freed seats; every free-seat
+chunk in a scan is claimed (not just the first `workers`); booking clients are
+persistent and pre-warmed; rediscovery fires early when the queue starves.
+
+Measured offline against a faithful mock (see `bench_old_vs_new.py`,
+`MOCK_README.md`):
+
+| scenario | old engine | new engine |
+|---|---|---|
+| single 113-seat house, clean | 113 paid · 100% ok | 113 paid · 100% ok |
+| three houses concurrently | 180 paid · 100% ok | 180 paid · 100% ok |
+| **seat-plan throttled at 14 rps** | **0 paid · 0% ok** (busy-sleeps burn every round) | **77+ paid · 100% ok** (governor rides the limit) |
+
+Under zero pressure both engines saturate the mock equally — localhost hides
+the new engine's TLS/session-reuse wins, which show up on the real network.
+Under MCL pressure the difference is existential.
+
+New knobs (all optional): `--max-conc-tix N`, `--max-conc-seatplan N`,
+env `FULLHOUSE_MAX_CONC_TIX=24`, `FULLHOUSE_MAX_CONC_SEATPLAN=8`,
+`FULLHOUSE_MAX_CONC_WWW=8`, `FULLHOUSE_VISIT_BUDGET=90`,
+`FULLHOUSE_STATS_INTERVAL=5`. Offline testing:
+`MCL_WWW_BASE / MCL_INFO_BASE / MCL_TIX_BASE` point anywhere (e.g. the mock).
+
 ## Install & run
 
 Requirements: Python **3.10+**, [`httpx`](https://www.python-httpx.org/) — nothing else.
@@ -107,9 +137,15 @@ default 6), `BLAZE_WORKERS`, `BLAZE_IDLE_POLL`.
 |---|---|
 | `fill_all.py` | orchestrator: discover → queue → concurrent house-fillers → rediscover (or `--poll` watchdog) |
 | `discover.py` | full-programme enumeration via MCLWebAPI2 (read-only); `--cinemas` / `--movies` rosters |
+| `governor.py` | global AIMD concurrency/rate controller — the "only MCL limits us" core |
+| `mclhosts.py` | base-URL resolution (`MCL_WWW_BASE` / `MCL_INFO_BASE` / `MCL_TIX_BASE`) |
+| `mock_mcl.py` | offline mock of every MCL endpoint (127.0.0.1 only) for testing/benchmarks |
+| `bench_old_vs_new.py` | automated baseline-vs-optimized benchmark (scenarios A/B/C) |
+| `tests_e2e_chain.py`, `tests_live_queue.py`, `tests_watchdog.py` | integration tests (all offline) |
+| `DESIGN.md`, `MOCK_README.md` | architecture + mock/testing docs |
 | `CINEMAS.md` | all venue codes + one-place-one-movie matching guide |
 | `launch_shards.ps1` | spawn N shard terminals or a watchdog window (Windows) |
-| `blaze2.py` | the proven pure-HTTP booking engine (unchanged from mcl-filler) |
+| `blaze2.py` | pure-HTTP booking engine v3: pooled clients, event-driven drains, zero sleeps |
 | `mcl_filler.py`, `find_sessions.py`, … | original single-session tooling, kept for reference |
 
 ## Provenance
