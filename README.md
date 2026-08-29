@@ -60,9 +60,6 @@ pip install httpx
 python3 discover.py --upcoming
 python3 discover.py --upcoming --json > programme.json
 
-# rehearse, then unleash
-python3 fill_all.py
-python3 fill_all.py --live --houses 4 --workers 12
 ```
 
 ### One venue, one movie
